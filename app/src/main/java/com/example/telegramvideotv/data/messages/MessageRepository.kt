@@ -181,25 +181,29 @@ class MessageRepository() {
         }
     }
 
+    /**
+     * Descarga un archivo pequeño de UI (avatar, sticker, miniatura de burbuja)
+     * con TDLib y entrega a la UI la ruta LOCAL que YA gestiona TDLib.
+     *
+     * Cambio vs versión anterior: ya NO copiamos/renombramos a cacheDir:
+     * - La copia duplicaba el uso de disco por cada thumbnail y dejaba
+     *   huérfanos tdlib_cache_* acumulándose entre sesiones.
+     * - Renombrar el archivo fuera de la ruta de TDLib rompía su registro
+     *   interno de rutas (provocaba re-descargas innecesarias del mismo fileId).
+     * TDLib mantiene estos archivos en su file cache, que se depura con
+     * OptimizeStorage desde MainActivity. Prioridad 16 = descarga de UI rápida.
+     */
     fun downloadToCache(fileId: Int, context: Context, onReady: (String) -> Unit) {
-        client?.send(TdApi.DownloadFile(fileId, 1, 0, 0, true)) { obj ->
-            if (obj is TdApi.File && obj.local.isDownloadingCompleted) {
-                val sourceFile = File(obj.local.path)
-
-                // Creamos el destino en la carpeta de CACHÉ del sistema
-                val cacheFile = File(context.cacheDir, "tdlib_cache_${sourceFile.name}")
-
-                if (sourceFile.exists()) {
-                    // Movemos el archivo de la carpeta /files a /cache
-                    sourceFile.renameTo(cacheFile)
-
-                    // Le avisamos a la UI que use la ruta del caché
-                    onReady(cacheFile.absolutePath)
-
-                    // IMPORTANTE: Para que TDLib no intente buscarlo en la ruta vieja
-                    // o lo vuelva a descargar, podemos dejarlo así.
-                    // Al estar en caché, Android lo borrará si necesita esos 800MB.
-                }
+        client?.send(TdApi.DownloadFile(fileId, 16, 0, 0, true)) { obj ->
+            when (obj) {
+                is TdApi.File ->
+                    if (obj.local.isDownloadingCompleted) {
+                        onReady(obj.local.path)
+                    } else {
+                        Log.w("MessageRepository", "downloadToCache: archivo $fileId llegó sin completar")
+                    }
+                is TdApi.Error ->
+                    Log.e("MessageRepository", "downloadToCache error ($fileId): ${obj.code} ${obj.message}")
             }
         }
     }

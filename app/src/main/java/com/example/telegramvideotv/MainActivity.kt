@@ -150,7 +150,14 @@ class MainActivity : ComponentActivity() {
         // Ejecutamos una limpieza rápida de archivos huérfanos
         val optimizeFunction = TdApi.OptimizeStorage(
             200 * 1024 * 1024L, 0, 1, 0,
-            arrayOf(TdApi.FileTypeVideo()), LongArray(0), LongArray(0), false, 0
+            arrayOf(
+                TdApi.FileTypeVideo(),
+                // Los stickers animados y los thumbnails de burbuja también
+                // suelen acumularse en el file cache de TDLib entre sesiones.
+                TdApi.FileTypeAnimation(),
+                TdApi.FileTypeThumbnail()
+            ),
+            LongArray(0), LongArray(0), false, 0
         )
         TelegramClient.client?.send(optimizeFunction) {}
     }

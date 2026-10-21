@@ -6,6 +6,8 @@ import com.example.telegramvideotv.data.messages.MessageItem
 import com.example.telegramvideotv.data.messages.MessageRepository
 
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.view.KeyEvent
 import android.view.View
@@ -62,6 +64,7 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSource
+import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.session.MediaSession
@@ -191,20 +194,12 @@ fun TelegramVideoPlayer(size: Long, fileId: Int, client: Client?) {
     val errorMessage = remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(fileId) {
-        // 1. Cancelamos cualquier descarga previa para limpiar la cola
-        client?.send(TdApi.CancelDownloadFile(fileId, false)) {
-            // 2. Iniciamos la descarga en modo "Streaming" (el 'true' al final es vital)
-            // El offset 0 es solo para arrancar; el DataSource pedirá el resto
-            client.send(TdApi.DownloadFile(fileId, 32, 0, 0, true)) { }
-        }
-//        // 1. Priorizamos el inicio del archivo de forma agresiva
-//        client?.send(TdApi.DownloadFile(fileId, 32, 0, 0, true)) { result ->
-//            if (result is TdApi.Error) {
-//                Log.e("Streaming", "Error al iniciar descarga: ${result.message}")
-//            } else {
-//                Log.d("Streaming", "Descarga de cabecera iniciada correctamente")
-//            }
-//        }
+        // Cancelamos descargas pendientes de estados anteriores para limpiar la cola.
+        // NO usamos DownloadFile(..., limit = 0): bajaría la película completa al disco
+        // (eso es lo que llenaba el almacenamiento y disparaba la notificación de
+        // "sin memoria/sin espacio" en la TV). El DataSource pide por sí mismo
+        // ventanas acotadas de 16 MB a medida que avanza la reproducción.
+        client?.send(TdApi.CancelDownloadFile(fileId, false)) { }
     }
 
     // 1. Construimos el reproductor
@@ -220,28 +215,57 @@ fun TelegramVideoPlayer(size: Long, fileId: Int, client: Client?) {
         val mediaSource = ProgressiveMediaSource.Factory(dataSourceFactory)
             .createMediaSource(MediaItem.fromUri("telegram://file/$fileId"))
 
-        ExoPlayer.Builder(context).build().apply {
+        // Construcción del player con búfer acotado estilo TV/Netflix:
+        // DefaultLoadControl por defecto reserva ~50s de vídeo (~30-50 MB
+        // de heap). En TVs de poca RAM eso presiona la memoria de la app;
+        // acotamos a 30s máximo (y 15s mínimo), con arranque rápido a 2.5s.
+        ExoPlayer.Builder(context)
+            .setLoadControl(
+                DefaultLoadControl.Builder()
+                    .setBufferDurationsMs(
+                        15_000, // minBufferMs
+                        30_000, // maxBufferMs
+                        2_500,  // bufferForPlaybackMs
+                        5_000   // bufferForPlaybackAfterRebufferMs
+                    )
+                    .build()
+            )
+            .build().apply {
             setMediaSource(mediaSource)
             prepare()
-            playWhenReady = false // No auto-reproducir para no saturar
+            playWhenReady = true // Auto-reproducir al preparar (arranque directo)
         }
     }
 
     LaunchedEffect(exoPlayer) {
+        var autoReintentos = 0
+        val handler = Handler(Looper.getMainLooper())
+
         val listener = object : Player.Listener {
             override fun onPlayerError(error: PlaybackException) {
-                Log.e("ExoPlayer_Error", "Error de reproducción: ${error.message}")
-                errorMessage.value = "Error de conexión con Telegram. Revisa tu internet."
-                // Aquí podrías mostrar un Toast o un diálogo:
-                // "Error de conexión. Reintentando..."
+                Log.e("ExoPlayer_Error", "Error de reproducción: ${error.message} (code=${error.errorCode})", error)
+                errorMessage.value = "Error de conexión con Telegram. Reintentando..."
 
-                // Opcional: Reintentar automáticamente
-                exoPlayer.prepare()
-                exoPlayer.play()
+                // Reintento automático acotado (máx. 3): la ventana de datos puede
+                // tardar en llegar de TDLib; un prepare() inmediato en bucle
+                // agotaría el intento del DataSource y dispararía errores en cadena.
+                if (autoReintentos < 3) {
+                    autoReintentos++
+                    handler.postDelayed({
+                        exoPlayer.prepare()
+                        exoPlayer.play()
+                    }, 2000)
+                }
             }
 
             override fun onPlaybackStateChanged(state: Int) {
                 playbackState.value = state
+                if (state == Player.STATE_READY) {
+                    // El búfer se recuperó y la reproducción está lista:
+                    // el error anterior quedó resuelto, quitamos el overlay.
+                    autoReintentos = 0
+                    errorMessage.value = null
+                }
                 Log.d("ExoPlayer_Status", "Estado: $state")
             }
         }
