@@ -29,6 +29,7 @@ import com.example.telegramvideotv.data.auth.AuthRepository
 import com.example.telegramvideotv.data.auth.AuthState
 import com.example.telegramvideotv.data.chatlist.ChatRepository
 import com.example.telegramvideotv.data.messages.MessageRepository
+import com.example.telegramvideotv.data.users.UserRepository
 import com.example.telegramvideotv.ui.auth.AuthViewModel
 import com.example.telegramvideotv.ui.auth.LoginScreen
 import com.example.telegramvideotv.ui.chatlist.ChatListScreen
@@ -48,6 +49,7 @@ import kotlin.getValue
 class MainActivity : ComponentActivity() {
     private lateinit var authRepository: AuthRepository
     private lateinit var chatRepository: ChatRepository
+    private lateinit var userRepository: UserRepository
     private lateinit var messageRepository: MessageRepository
 
     // Este es el manejador único que le pasas a Client.create()
@@ -62,7 +64,12 @@ class MainActivity : ComponentActivity() {
                 }
 
                 // 2. ACTUALIZACIONES DE CHATS (Solo si estamos logueados)
-                is TdApi.UpdateNewChat,
+                is TdApi.UpdateNewChat -> {
+                    chatRepository.handleChatUpdate(update)
+                    // El chat también alimenta la caché de remitentes
+                    // (mensajes posteados por canales/admins).
+                    userRepository.rememberChat(update.chat)
+                }
                 is TdApi.UpdateChatTitle,
                 is TdApi.UpdateChatLastMessage,
                 is TdApi.UpdateChatPosition -> {
@@ -71,7 +78,15 @@ class MainActivity : ComponentActivity() {
 
                 // 3. ACTUALIZACIONES DE USUARIOS (Nombres, fotos de perfil)
                 is TdApi.UpdateUser -> {
-                    // userRepository.handleUserUpdate(update)
+                    userRepository.handleUserUpdate(update)
+                }
+
+                // Fase 4b: estado de lectura (recibos ✓✓ y separador de no leídos)
+                is TdApi.UpdateChatReadOutbox -> {
+                    messageRepository.handleChatReadOutbox(update.chatId, update.lastReadOutboxMessageId)
+                }
+                is TdApi.UpdateChatReadInbox -> {
+                    messageRepository.handleChatReadInbox(update.chatId, update.lastReadInboxMessageId)
                 }
 
                 // 4. NUEVOS MENSAJES (Para notificaciones o chats abiertos)
@@ -115,7 +130,8 @@ class MainActivity : ComponentActivity() {
 
         authRepository = AuthRepository()
         chatRepository = ChatRepository()
-        messageRepository = MessageRepository()
+        userRepository = UserRepository()
+        messageRepository = MessageRepository(userRepository)
 
         val client = Client.create(rootHandler, null, null)
         TelegramClient.client = client
@@ -126,6 +142,7 @@ class MainActivity : ComponentActivity() {
         authRepository.initDatabasePath(tdlibPath)
         authRepository.initClient(client)
         chatRepository.initClient(client)
+        userRepository.initClient(client)
         messageRepository.initClient(client)
 
         val authViewModel = AuthViewModel(authRepository)

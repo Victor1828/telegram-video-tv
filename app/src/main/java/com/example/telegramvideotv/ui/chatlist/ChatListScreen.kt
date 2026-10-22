@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
@@ -96,6 +97,7 @@ import com.example.telegramvideotv.data.chatlist.ChatItem
 import com.example.telegramvideotv.data.messages.MessageContent
 import com.example.telegramvideotv.data.messages.MessageItem
 import com.example.telegramvideotv.data.messages.MessageRepository
+import com.example.telegramvideotv.data.messages.ReplyPreview
 import org.drinkless.tdlib.TdApi
 import java.io.File
 import kotlin.math.ln
@@ -220,6 +222,123 @@ fun ChatListScreen(chats: List<ChatItem>, messages: List<MessageItem>, filteredM
     }
 }
 
+// Fase 4: items renderizables en la lista del chat (burbuja o separador de fecha)
+sealed interface ChatListItem {
+    data class DateSeparator(val dayKey: String, val label: String) : ChatListItem
+    data class MessageEntry(val msg: MessageItem, val startsGroup: Boolean) : ChatListItem
+    data object UnreadSeparator : ChatListItem // Fase 4b: línea roja "No leídos"
+}
+
+// Ventana máx. (segundos) para agrupar mensajes consecutivos del mismo remitente
+private const val GROUP_TIME_GAP_SECONDS = 5 * 60
+
+private fun dayKeyOf(dateSecs: Int): String {
+    val fmt = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US)
+    return fmt.format(java.util.Date(dateSecs.toLong() * 1000L))
+}
+
+private fun dateSeparatorLabel(dayKey: String, dateSecs: Int): String {
+    val fmt = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US)
+    val now = java.util.Calendar.getInstance().timeInMillis
+    val todayKey = fmt.format(java.util.Date(now))
+    val yesterdayKey = fmt.format(java.util.Date(now - 86_400_000L))
+    return when (dayKey) {
+        todayKey -> "Hoy"
+        yesterdayKey -> "Ayer"
+        else -> java.text.SimpleDateFormat("d MMM yyyy", java.util.Locale.getDefault())
+            .format(java.util.Date(dateSecs.toLong() * 1000L))
+    }
+}
+
+// Convierte la lista cronológica de mensajes (antiguos arriba) en items con
+// separadores de fecha, separador de no leídos y flags de agrupamiento
+// (Telegram agrupa burbujas consecutivas del mismo remitente ocultando el header repetido)
+fun buildChatListItems(
+    messages: List<MessageItem>,
+    lastReadInboxMessageId: Long = 0L
+): List<ChatListItem> {
+    if (messages.isEmpty()) return emptyList()
+    val items = mutableListOf<ChatListItem>()
+    var prevDay: String? = null
+    var prev: MessageItem? = null
+    var unreadSeparatorInserted = false
+    for (msg in messages) {
+        val day = dayKeyOf(msg.date)
+        val dayChanged = day != prevDay
+        if (dayChanged) {
+            items += ChatListItem.DateSeparator(day, dateSeparatorLabel(day, msg.date))
+        }
+        // Fase 4b: separador antes del primer mensaje recibido no leído
+        // (id > lastReadInboxMessageId, solo mensajes entrantes)
+        if (!unreadSeparatorInserted && !msg.isOutgoing && msg.id > lastReadInboxMessageId) {
+            items += ChatListItem.UnreadSeparator
+            unreadSeparatorInserted = true
+        }
+        val p = prev
+        val sameGroup = p != null && !dayChanged &&
+            p.senderId == msg.senderId &&
+            p.isOutgoing == msg.isOutgoing &&
+            (msg.date - p.date) <= GROUP_TIME_GAP_SECONDS
+        items += ChatListItem.MessageEntry(msg, startsGroup = !sameGroup)
+        prev = msg
+        prevDay = day
+    }
+    return items
+}
+
+@Composable
+fun DateSeparatorPill(label: String) {    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 8.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = label,
+            modifier = Modifier
+                .clip(RoundedCornerShape(12.dp))
+                .background(Color(0xFF2b5278))
+                .padding(horizontal = 12.dp, vertical = 4.dp),
+            color = Color.White.copy(alpha = 0.9f),
+            style = MaterialTheme.typography.labelSmall
+        )
+    }
+}
+
+// Fase 4b: separador de mensajes no leídos (línea roja bajo la posición de lectura)
+@Composable
+fun UnreadSeparatorPill() {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .height(1.dp)
+                .background(Color(0xFFe17076).copy(alpha = 0.6f))
+        )
+        Text(
+            text = "No leídos",
+            modifier = Modifier
+                .padding(horizontal = 8.dp)
+                .clip(RoundedCornerShape(10.dp))
+                .background(Color(0xFF2b5278))
+                .padding(horizontal = 10.dp, vertical = 3.dp),
+            color = Color(0xFFe17076),
+            style = MaterialTheme.typography.labelSmall
+        )
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .height(1.dp)
+                .background(Color(0xFFe17076).copy(alpha = 0.6f))
+        )
+    }
+}
+
 @Composable
 fun MessageListContent(
     messages: List<MessageItem>,
@@ -234,13 +353,37 @@ fun MessageListContent(
         if (messages.isEmpty()) {
             CircularProgressIndicator(modifier = Modifier.align(Alignment.Center), color = Color(0xFF2481cc))
         } else {
+            // Fase 4b: estado de lectura del chat abierto
+            val lastReadInboxMessageId by messageRepository.lastReadInboxMessageId.collectAsState()
+            val lastReadOutboxMessageId by messageRepository.lastReadOutboxMessageId.collectAsState()
+            val items = buildChatListItems(messages, lastReadInboxMessageId)
             LazyColumn(
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = PaddingValues(16.dp),
                 reverseLayout = true // Mensajes nuevos abajo
             ) {
-                items(messages.reversed(), key = { it.id }) { msg ->
-                    MessageBubble(msg, messageRepository, onNavigateToVideo)
+                items(
+                    items.asReversed(),
+                    key = { item ->
+                        when (item) {
+                            is ChatListItem.DateSeparator -> "date_${item.dayKey}"
+                            is ChatListItem.UnreadSeparator -> "unread_separator"
+                            is ChatListItem.MessageEntry -> "msg_${item.msg.id}"
+                        }
+                    }
+                ) { item ->
+                    when (item) {
+                        is ChatListItem.DateSeparator -> DateSeparatorPill(item.label)
+                        is ChatListItem.UnreadSeparator -> UnreadSeparatorPill()
+                        is ChatListItem.MessageEntry ->
+                            MessageBubble(
+                                item.msg,
+                                messageRepository,
+                                onNavigateToVideo,
+                                item.startsGroup,
+                                lastReadOutboxMessageId
+                            )
+                    }
                 }
             }
         }
@@ -475,8 +618,177 @@ fun ChatItemRow(chat: ChatItem, isSelected: Boolean, messageRepository: MessageR
 //    }
 }
 
+// Paleta estilo Telegram: color por hash del senderId (memes subsanables).
+private val senderPalette = listOf(
+    0xFFe17076, 0xFF7bc862, 0xFF65aadd, 0xFFa695e7, 0xFFee7aae, 0xFFfaa774
+)
+
+fun senderColorFor(senderId: Long): Color {
+    val idx = ((senderId % senderPalette.size) + senderPalette.size) % senderPalette.size
+    return Color(senderPalette[idx.toInt()])
+}
+
 @Composable
-fun MessageBubble(msg: MessageItem, messageRepository: MessageRepository, onNavigateToVideo: (Int, Long) -> Unit) {
+fun BubbleAvatar(photoFileId: Int?, messageRepository: MessageRepository) {
+    val avatarPath = remember { mutableStateOf<String?>(null) }
+    val context = LocalContext.current
+
+    LaunchedEffect(photoFileId) {
+        if (photoFileId != null && photoFileId != 0) {
+            messageRepository.downloadToCache(photoFileId, context) { path ->
+                avatarPath.value = path
+            }
+        }
+    }
+
+    if (avatarPath.value != null) {
+        AsyncImage(
+            model = avatarPath.value,
+            contentDescription = "Avatar del remitente",
+            modifier = Modifier
+                .size(24.dp)
+                .clip(CircleShape),
+            contentScale = ContentScale.Crop,
+        )
+    } else {
+        // Placeholder circular con la inicial mientras llega el avatar
+        Box(
+            modifier = Modifier
+                .size(24.dp)
+                .clip(CircleShape)
+                .background(Color(0xFF405670)),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                text = "•",
+                color = Color.White,
+                style = MaterialTheme.typography.labelSmall
+            )
+        }
+    }
+}
+
+@Composable
+fun SenderHeader(msg: MessageItem, messageRepository: MessageRepository) {
+    val users = messageRepository.users
+    val usersMap by users.usersMap.collectAsState()
+
+    LaunchedEffect(msg.senderId) {
+        users.ensureSender(msg.senderId)
+    }
+
+    val info = usersMap[msg.senderId]
+    Row(
+        modifier = Modifier.padding(
+            bottom = 4.dp,
+            start = 4.dp
+        ),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        BubbleAvatar(info?.avatarFileId, messageRepository)
+        Spacer(Modifier.width(6.dp))
+        Text(
+            text = info?.name?.ifEmpty { null } ?: "Usuario",
+            color = senderColorFor(msg.senderId),
+            style = MaterialTheme.typography.titleSmall
+        )
+    }
+}
+
+/**
+ * Fase 2: cita estilo Telegram — barra de acento + autor del mensaje
+ * citado + snippet de su contenido (texto, "🖼 Foto", "🎤 Nota de voz"…).
+ */
+@Composable
+fun ReplyQuote(preview: ReplyPreview, accentColor: Color) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(start = 4.dp, bottom = 6.dp)
+            .height(IntrinsicSize.Min)
+            .clip(RoundedCornerShape(6.dp))
+            .background(Color.White.copy(alpha = 0.08f))
+    ) {
+        Box(
+            modifier = Modifier
+                .width(2.dp)
+                .fillMaxHeight()
+                .background(accentColor)
+        )
+        Column(
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+        ) {
+            Text(
+                text = preview.senderName,
+                color = accentColor,
+                style = MaterialTheme.typography.labelLarge,
+                maxLines = 1
+            )
+            Text(
+                text = preview.snippet,
+                color = Color.White.copy(alpha = 0.7f),
+                style = MaterialTheme.typography.bodySmall,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
+@Composable
+fun MediaCard(
+    emoji: String,
+    title: String,
+    subtitle: String,
+    onClick: (() -> Unit)? = null
+) {
+    Row(
+        modifier = Modifier
+            .widthIn(max = 300.dp)
+            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
+            .clip(RoundedCornerShape(8.dp))
+            .background(Color.White.copy(alpha = 0.06f))
+            .padding(8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(
+            modifier = Modifier
+                .size(40.dp)
+                .background(Color(0xFF405670), CircleShape),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(emoji, style = MaterialTheme.typography.titleMedium)
+        }
+        Spacer(Modifier.width(10.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                title,
+                color = Color.White,
+                style = MaterialTheme.typography.bodyMedium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                subtitle,
+                color = Color.White.copy(alpha = 0.6f),
+                style = MaterialTheme.typography.labelSmall
+            )
+        }
+        if (onClick != null) {
+            Spacer(Modifier.width(6.dp))
+            Text("▶", color = Color(0xFF4ecaff), style = MaterialTheme.typography.titleMedium)
+        }
+    }
+}
+
+@Composable
+fun MessageBubble(
+    msg: MessageItem,
+    messageRepository: MessageRepository,
+    onNavigateToVideo: (Int, Long) -> Unit,
+    startsGroup: Boolean = true, // Fase 4: header/avatar solo en el primer mensaje del grupo
+    lastReadOutboxMessageId: Long = 0L // Fase 4b: para los checks ✓/✓✓
+) {
 //    var isFocused by remember { mutableStateOf(false) }
 //
 //    // El color de fondo cambia según si es mío o del otro, y si tiene el foco del control remoto
@@ -568,9 +880,11 @@ fun MessageBubble(msg: MessageItem, messageRepository: MessageRepository, onNavi
                 .onFocusChanged { isFocused = it.isFocused }
                 // Usamos clickable directamente en el modificador
                 .clickable {
-                    if (msg.content is MessageContent.Video) {
-                        val content = msg.content
-                        onNavigateToVideo(content.fileId, content.size)
+                    when (val c = msg.content) {
+                        is MessageContent.Video -> onNavigateToVideo(c.fileId, c.size)
+                        is MessageContent.Animation -> onNavigateToVideo(c.fileId, c.size)
+                        is MessageContent.VideoNote -> onNavigateToVideo(c.fileId, c.size)
+                        else -> {}
                     }
                 }
                 .border(
@@ -580,6 +894,13 @@ fun MessageBubble(msg: MessageItem, messageRepository: MessageRepository, onNavi
                 )
         ) {
             Column(modifier = Modifier.padding(12.dp)) {
+                if (!msg.isOutgoing && msg.senderId != 0L && startsGroup) {
+                    SenderHeader(msg, messageRepository)
+                }
+                // Fase 2: cita del mensaje original (reply), si ya está resuelta
+                msg.replyPreview?.let { preview ->
+                    ReplyQuote(preview, senderColorFor(msg.senderId))
+                }
                 when (val content = msg.content) {
                     is MessageContent.Text -> {
                         Text(text = content.text, color = Color.White)
@@ -590,22 +911,90 @@ fun MessageBubble(msg: MessageItem, messageRepository: MessageRepository, onNavi
                         //VideoThumbnail(content.duration, content.fileSize, content.caption)
                     }
                     is MessageContent.Photo -> {
-                        TelegramGenericCard(msg, onClick = {})
+                        PhotoContent(content, messageRepository)
                     }
                     is MessageContent.Sticker -> {
                         StickerItem(content, messageRepository)
                     }
+                    is MessageContent.Animation -> {
+                        MediaCard(
+                            emoji = "🎞",
+                            title = content.caption.takeIf { it.isNotEmpty() } ?: "GIF",
+                            subtitle = "${content.duration.toTimeFormat()} • ${content.size.toReadableFileSize()}",
+                            onClick = { onNavigateToVideo(content.fileId, content.size) }
+                        )
+                    }
+                    is MessageContent.Document -> {
+                        MediaCard(
+                            emoji = "📄",
+                            title = content.fileName.takeIf { it.isNotEmpty() } ?: "Documento",
+                            subtitle = content.size.toReadableFileSize()
+                        )
+                    }
+                    is MessageContent.VoiceNote -> {
+                        MediaCard(
+                            emoji = "🎤",
+                            title = "Nota de voz",
+                            subtitle = content.duration.toTimeFormat()
+                        )
+                    }
+                    is MessageContent.Audio -> {
+                        val title = content.title.takeIf { it.isNotEmpty() }
+                            ?: content.performer.takeIf { it.isNotEmpty() }
+                            ?: "Audio"
+                        val sub = buildString {
+                            if (content.performer.isNotEmpty() && content.title.isNotEmpty()) {
+                                append(content.performer)
+                                append(" • ")
+                            }
+                            append(content.duration.toTimeFormat())
+                        }
+                        MediaCard(
+                            emoji = "🎵",
+                            title = title,
+                            subtitle = "${content.size.toReadableFileSize()} • $sub"
+                        )
+                    }
+                    is MessageContent.VideoNote -> {
+                        MediaCard(
+                            emoji = "⚪",
+                            title = "Nota de video",
+                            subtitle = content.duration.toTimeFormat(),
+                            onClick = { onNavigateToVideo(content.fileId, content.size) }
+                        )
+                    }
                     else -> {}
                 }
 
-                val msgDate = msg.date
-                // Hora y Estado
-                Text(
-                    text = msgDate.toReadableDate(),
+                // Hora + estado de lectura (Fase 4b)
+                Row(
                     modifier = Modifier.align(Alignment.End),
-                    style = MaterialTheme.typography.labelSmall,
-                    color = Color.White.copy(alpha = 0.5f)
-                )
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    if (msg.isEdited) {
+                        Text(
+                            text = "editada",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = Color.White.copy(alpha = 0.4f)
+                        )
+                        Spacer(Modifier.width(4.dp))
+                    }
+                    Text(
+                        text = msg.date.toReadableDate(),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Color.White.copy(alpha = 0.5f)
+                    )
+                    if (msg.isOutgoing) {
+                        Spacer(Modifier.width(4.dp))
+                        val read = msg.id <= lastReadOutboxMessageId
+                        Icon(
+                            imageVector = if (read) Icons.Default.DoneAll else Icons.Default.Done,
+                            contentDescription = if (read) "Leído" else "Enviado",
+                            modifier = Modifier.size(14.dp),
+                            tint = if (read) Color(0xFF4ecaff) else Color.White.copy(alpha = 0.5f)
+                        )
+                    }
+                }
             }
         }
     }
@@ -697,6 +1086,54 @@ fun VideoThumbnail(duration: String, fileSize: String, caption: String) {
             style = MaterialTheme.typography.bodyMedium,
             color = Color.White
         )
+    }
+}
+
+// Fase 4: render real de fotos (antes TelegramGenericCard mostraba solo el icono de documento
+// porque todo el código de miniaturas estaba comentado)
+@Composable
+fun PhotoContent(photo: MessageContent.Photo, messageRepository: MessageRepository) {
+    val context = LocalContext.current
+    var path by remember(photo.fileId) { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(photo.fileId) {
+        messageRepository.downloadToCache(photo.fileId, context) { p ->
+            path = p
+        }
+    }
+
+    Column {
+        Box(
+            modifier = Modifier
+                .width(280.dp)
+                .height(200.dp)
+                .clip(RoundedCornerShape(8.dp))
+                .background(Color.Black),
+            contentAlignment = Alignment.Center
+        ) {
+            if (path != null) {
+                AsyncImage(
+                    model = path,
+                    contentDescription = "Foto",
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Crop
+                )
+            } else {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(32.dp),
+                    color = Color(0xFF2481cc),
+                    strokeWidth = 3.dp
+                )
+            }
+        }
+        if (photo.caption.isNotEmpty()) {
+            Text(
+                text = photo.caption,
+                modifier = Modifier.padding(top = 4.dp),
+                color = Color.White,
+                style = MaterialTheme.typography.bodyLarge
+            )
+        }
     }
 }
 
